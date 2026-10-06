@@ -1,0 +1,2046 @@
+```ts
+/**
+ * INVENTORY RULE
+ *
+ * productInStock.baseQuantity
+ *     =
+ * SUM(stockInItem.remainingQuantity)
+ *
+ * for the same:
+ *
+ * businessID + branchID + stockID + productID
+ *
+ * Every operation that changes inventory must happen inside
+ * ONE database transaction.
+ */
+
+
+/* ============================================================
+ * Helpers
+ * ============================================================ */
+
+function toPositiveNumber(value: unknown, field: string): number {
+    const number = Number(value);
+
+    if (!Number.isFinite(number) || number <= 0) {
+        throw new Error(`Invalid ${field}`);
+    }
+
+    return number;
+}
+
+function toNonNegativeNumber(value: unknown, field: string): number {
+    const number = Number(value);
+
+    if (!Number.isFinite(number) || number < 0) {
+        throw new Error(`Invalid ${field}`);
+    }
+
+    return number;
+}
+
+
+/* ============================================================
+ * RECORD INVENTORY MOVEMENT
+ *
+ * IMPORTANT:
+ * This function assumes the caller already owns the transaction.
+ *
+ * Do NOT begin/commit a transaction here if consumeStock()
+ * is calling this function.
+ * ============================================================ */
+
+export async function recordInventoryMovement(
+    connection: PoolConnection,
+    schema: string,
+    movement: {
+        id: number;
+        businessID: number;
+        branchID: number;
+        stockID: number;
+        productID: number;
+        created_by: number;
+        referenceType: referenceType;
+        referenceID?: number;
+        quantityIn?: number;
+        quantityOut?: number;
+        baseQuantity?: number;
+        costPrice?: number;
+        currencySnapshotID?: number;
+        sessionID?: number | string | null;
+        createdAt?: string;
+    }
+) {
+    const movementTable =
+        new InventoryMovementTable(undefined, connection, schema);
+
+    const productInStockTable =
+        new ProductInStockTable(undefined, connection, schema);
+
+    const quantityIn =
+        movement.quantityIn === undefined
+            ? 0
+            : Number(movement.quantityIn);
+
+    const quantityOut =
+        movement.quantityOut === undefined
+            ? 0
+            : Number(movement.quantityOut);
+
+    if (!Number.isFinite(quantityIn) || quantityIn < 0) {
+        throw new Error("Invalid quantityIn");
+    }
+
+    if (!Number.isFinite(quantityOut) || quantityOut < 0) {
+        throw new Error("Invalid quantityOut");
+    }
+
+    if (quantityIn === 0 && quantityOut === 0) {
+        throw new Error(
+            "Inventory movement must have a quantity"
+        );
+    }
+
+    if (quantityIn > 0 && quantityOut > 0) {
+        throw new Error(
+            "Inventory movement cannot have both quantityIn and quantityOut"
+        );
+    }
+
+    /*
+     * NEVER trust baseQuantity supplied by the caller.
+     *
+     * Calculate it from quantityIn / quantityOut.
+     */
+    const baseQuantity =
+        quantityIn - quantityOut;
+
+    if (!Number.isFinite(baseQuantity) || baseQuantity === 0) {
+        throw new Error("Invalid base quantity");
+    }
+
+
+    /* ========================================================
+     * Lock aggregate stock row
+     * ======================================================== */
+
+    const [stockRows]: any =
+        await connection.query(
+            `
+            SELECT *
+            FROM \`${schema}\`.\`productInStock\`
+            WHERE businessID = ?
+              AND branchID = ?
+              AND stockID = ?
+              AND productID = ?
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [
+                movement.businessID,
+                movement.branchID,
+                movement.stockID,
+                movement.productID
+            ]
+        );
+
+
+    const currentStock =
+        stockRows.length
+            ? Number(stockRows[0].baseQuantity || 0)
+            : 0;
+
+    if (
+        !Number.isFinite(currentStock) ||
+        currentStock < 0
+    ) {
+        throw new Error(
+            `Invalid current stock for product ${movement.productID}`
+        );
+    }
+
+    const newStock =
+        currentStock + baseQuantity;
+
+
+    /* ========================================================
+     * Prevent negative inventory
+     * ======================================================== */
+
+    if (newStock < 0) {
+        throw new Error(
+            `Stock cannot go negative. ` +
+            `Available: ${currentStock}, ` +
+            `requested: ${Math.abs(baseQuantity)}`
+        );
+    }
+
+
+    /* ========================================================
+     * Save immutable inventory movement
+     * ======================================================== */
+
+    movementTable.setValues({
+        ...movement,
+
+        quantityIn,
+        quantityOut,
+
+        /*
+         * Always use calculated value.
+         */
+        baseQuantity,
+
+        createdAt:
+            movement.createdAt || fullDateTime()
+    });
+
+    const movementResult =
+        await movementTable.save();
+
+    if (movementResult.type !== "success") {
+        throw new Error(
+            "Failed saving inventory movement"
+        );
+    }
+
+
+    /* ========================================================
+     * Update / create aggregate stock
+     * ======================================================== */
+
+    if (stockRows.length) {
+
+        productInStockTable.setValues({
+            id: stockRows[0].id,
+            baseQuantity: newStock,
+            updatedAt: fullDateTime()
+        });
+
+        const updateResult =
+            await productInStockTable.update([
+                "baseQuantity",
+                "updatedAt"
+            ]);
+
+        if (updateResult !== "success") {
+            throw new Error(
+                "Failed updating product stock"
+            );
+        }
+
+    } else {
+
+        /*
+         * We should never be able to create a new aggregate
+         * stock record from a negative movement.
+         */
+        if (newStock < 0) {
+            throw new Error(
+                "Cannot create stock with negative balance"
+            );
+        }
+
+        productInStockTable.setValues({
+            id: generateID(),
+
+            businessID:
+                movement.businessID,
+
+            branchID:
+                movement.branchID,
+
+            stockID:
+                movement.stockID,
+
+            productID:
+                movement.productID,
+
+            baseQuantity:
+                newStock,
+
+            reorderLevel:
+                15,
+
+            status:
+                "active",
+
+            sessionID:
+                movement.sessionID,
+
+            createdAt:
+                fullDateTime(),
+
+            updatedAt:
+                fullDateTime()
+        });
+
+        const saveResult =
+            await productInStockTable.save();
+
+        if (saveResult.type !== "success") {
+            throw new Error(
+                "Failed creating product stock"
+            );
+        }
+    }
+
+
+    return {
+        success: true,
+
+        movementID:
+            movement.id,
+
+        previousStock:
+            currentStock,
+
+        movementQuantity:
+            baseQuantity,
+
+        currentStock:
+            newStock
+    };
+}
+
+
+/* ============================================================
+ * CONSUME STOCK
+ *
+ * FIFO / FEFO
+ *
+ * EVERYTHING happens inside ONE transaction.
+ * ============================================================ */
+
+export async function consumeStock(
+    connection: PoolConnection,
+    schema: string,
+    data: {
+        businessID: number;
+        branchID: number;
+        stockID: number;
+
+        saleID: number;
+        salesItemID: number;
+
+        productID: number;
+        quantity: number;
+
+        created_by: number;
+
+        strategy?: "FIFO" | "FEFO";
+
+        currencySnapshotID?: number;
+
+        sessionID?: number | string | null;
+    }
+) {
+    const stockInItemTable =
+        new StockInItemTable(
+            undefined,
+            connection,
+            schema
+        );
+
+    const saleBatchConsumptionTable =
+        new SaleBatchConsumptionTable(
+            undefined,
+            connection,
+            schema
+        );
+
+
+    const quantityRequired =
+        toPositiveNumber(
+            data.quantity,
+            "quantity"
+        );
+
+    const productID =
+        Number(data.productID);
+
+    if (
+        !Number.isInteger(productID) ||
+        productID <= 0
+    ) {
+        throw new Error(
+            "Invalid product ID"
+        );
+    }
+
+    if (
+        !Number.isInteger(data.saleID) ||
+        data.saleID <= 0
+    ) {
+        throw new Error(
+            "Invalid sale ID"
+        );
+    }
+
+    if (
+        !Number.isInteger(data.salesItemID) ||
+        data.salesItemID <= 0
+    ) {
+        throw new Error(
+            "Invalid sales item ID"
+        );
+    }
+
+
+    /* ========================================================
+     * BEGIN TRANSACTION
+     * ======================================================== */
+
+    await connection.beginTransaction();
+
+    try {
+
+        /* ====================================================
+         * 1. LOCK PRODUCT STOCK
+         * ==================================================== */
+
+        const [stockRows]: any =
+            await connection.query(
+                `
+                SELECT *
+                FROM \`${schema}\`.\`productInStock\`
+                WHERE businessID = ?
+                  AND branchID = ?
+                  AND stockID = ?
+                  AND productID = ?
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [
+                    data.businessID,
+                    data.branchID,
+                    data.stockID,
+                    productID
+                ]
+            );
+
+
+        if (!stockRows.length) {
+            throw new Error(
+                "Product is out of stock"
+            );
+        }
+
+
+        const stock =
+            stockRows[0];
+
+        const currentStock =
+            Number(
+                stock.baseQuantity || 0
+            );
+
+
+        if (
+            !Number.isFinite(currentStock) ||
+            currentStock < 0
+        ) {
+            throw new Error(
+                "Invalid product stock balance"
+            );
+        }
+
+
+        if (
+            currentStock < quantityRequired
+        ) {
+            throw new Error(
+                `Insufficient stock. ` +
+                `Available: ${currentStock}, ` +
+                `requested: ${quantityRequired}`
+            );
+        }
+
+
+        /* ====================================================
+         * 2. GET + LOCK AVAILABLE BATCHES
+         *
+         * IMPORTANT:
+         * FOR UPDATE prevents another sale from consuming
+         * the same batch simultaneously.
+         * ==================================================== */
+
+        const [batches]: any =
+            await connection.query(
+                `
+                SELECT
+                    sii.*,
+                    si.branchID,
+                    si.stockID
+
+                FROM \`${schema}\`.\`stockInItem\` sii
+
+                INNER JOIN \`${schema}\`.\`stockIn\` si
+                    ON si.id = sii.stockInID
+
+                WHERE sii.businessID = ?
+                  AND si.branchID = ?
+                  AND si.stockID = ?
+                  AND sii.productID = ?
+                  AND sii.status = 'active'
+                  AND sii.remainingQuantity > 0
+
+                ORDER BY
+                    sii.expiryDate ASC,
+                    sii.createdAt ASC
+
+                FOR UPDATE
+                `,
+                [
+                    data.businessID,
+                    data.branchID,
+                    data.stockID,
+                    productID
+                ]
+            );
+
+
+        if (!batches.length) {
+            throw new Error(
+                "Product has no available stock batches"
+            );
+        }
+
+
+        /* ====================================================
+         * 3. CALCULATE TOTAL AVAILABLE BATCH STOCK
+         * ==================================================== */
+
+        let batchAvailable = 0;
+
+        for (const batch of batches) {
+
+            const remaining =
+                Number(
+                    batch.remainingQuantity || 0
+                );
+
+            if (
+                !Number.isFinite(remaining) ||
+                remaining < 0
+            ) {
+                throw new Error(
+                    `Invalid remaining quantity ` +
+                    `for stock batch ${batch.id}`
+                );
+            }
+
+            batchAvailable += remaining;
+        }
+
+
+        /*
+         * This is an important invariant.
+         *
+         * Aggregate stock MUST equal batch stock.
+         */
+        if (
+            batchAvailable !== currentStock
+        ) {
+            throw new Error(
+                `Inventory inconsistency for product ${productID}. ` +
+                `ProductInStock: ${currentStock}, ` +
+                `available batches: ${batchAvailable}`
+            );
+        }
+
+
+        if (
+            batchAvailable < quantityRequired
+        ) {
+            throw new Error(
+                `Insufficient batch stock. ` +
+                `Available: ${batchAvailable}, ` +
+                `requested: ${quantityRequired}`
+            );
+        }
+
+
+        /* ====================================================
+         * 4. SORT BATCHES
+         * ==================================================== */
+
+        const strategy =
+            data.strategy || "FEFO";
+
+
+        if (strategy === "FEFO") {
+
+            batches.sort(
+                (a: any, b: any) => {
+
+                    const aExpiry =
+                        a.expiryDate
+                            ? new Date(
+                                a.expiryDate
+                            ).getTime()
+                            : Number.POSITIVE_INFINITY;
+
+                    const bExpiry =
+                        b.expiryDate
+                            ? new Date(
+                                b.expiryDate
+                            ).getTime()
+                            : Number.POSITIVE_INFINITY;
+
+
+                    if (
+                        aExpiry !== bExpiry
+                    ) {
+                        return (
+                            aExpiry -
+                            bExpiry
+                        );
+                    }
+
+
+                    return (
+                        new Date(
+                            a.createdAt
+                        ).getTime() -
+                        new Date(
+                            b.createdAt
+                        ).getTime()
+                    );
+                }
+            );
+
+        } else {
+
+            batches.sort(
+                (a: any, b: any) =>
+                    new Date(
+                        a.createdAt
+                    ).getTime() -
+                    new Date(
+                        b.createdAt
+                    ).getTime()
+            );
+        }
+
+
+        /* ====================================================
+         * 5. CONSUME BATCHES
+         * ==================================================== */
+
+        let quantityRemaining =
+            quantityRequired;
+
+        let totalCost = 0;
+
+
+        const consumptions: {
+            stockInID: number;
+            stockInItemID: number;
+            quantity: number;
+            costPrice: number;
+            totalCost: number;
+        }[] = [];
+
+
+        for (
+            const batch of batches
+        ) {
+
+            if (
+                quantityRemaining <= 0
+            ) {
+                break;
+            }
+
+
+            const stockInItemID =
+                Number(batch.id);
+
+
+            const stockInID =
+                Number(batch.stockInID);
+
+
+            const available =
+                Number(
+                    batch.remainingQuantity || 0
+                );
+
+
+            if (
+                !Number.isInteger(
+                    stockInItemID
+                ) ||
+                stockInItemID <= 0
+            ) {
+                throw new Error(
+                    "Invalid stock-in item ID"
+                );
+            }
+
+
+            if (
+                !Number.isInteger(
+                    stockInID
+                ) ||
+                stockInID <= 0
+            ) {
+                throw new Error(
+                    "Invalid stock-in ID"
+                );
+            }
+
+
+            if (
+                !Number.isFinite(
+                    available
+                ) ||
+                available <= 0
+            ) {
+                continue;
+            }
+
+
+            const quantityConsumed =
+                Math.min(
+                    quantityRemaining,
+                    available
+                );
+
+
+            const costPrice =
+                Number(
+                    batch.costPrice || 0
+                );
+
+
+            if (
+                !Number.isFinite(
+                    costPrice
+                ) ||
+                costPrice < 0
+            ) {
+                throw new Error(
+                    `Invalid cost price ` +
+                    `for stock batch ${stockInItemID}`
+                );
+            }
+
+
+            const batchCost =
+                quantityConsumed *
+                costPrice;
+
+
+            const remainingQuantity =
+                available -
+                quantityConsumed;
+
+
+            /* ================================================
+             * Update batch
+             * ================================================ */
+
+            const [updateResult]: any =
+                await connection.query(
+                    `
+                    UPDATE \`${schema}\`.\`stockInItem\`
+                    SET remainingQuantity = ?
+                    WHERE id = ?
+                      AND remainingQuantity >= ?
+                    `,
+                    [
+                        remainingQuantity,
+                        stockInItemID,
+                        quantityConsumed
+                    ]
+                );
+
+
+            if (
+                updateResult.affectedRows !== 1
+            ) {
+                throw new Error(
+                    `Failed updating stock batch ${stockInItemID}`
+                );
+            }
+
+
+            /* ================================================
+             * Record batch consumption
+             * ================================================ */
+
+            saleBatchConsumptionTable.setValues({
+
+                id:
+                    generateID(),
+
+                businessID:
+                    data.businessID,
+
+                branchID:
+                    data.branchID,
+
+                saleID:
+                    data.saleID,
+
+                saleItemID:
+                    data.salesItemID,
+
+                stockInID:
+                    stockInID,
+
+                stockInItemID:
+                    stockInItemID,
+
+                productID:
+                    productID,
+
+                quantity:
+                    quantityConsumed,
+
+                costPrice:
+                    costPrice,
+
+                totalCost:
+                    batchCost,
+
+                status:
+                    "active",
+
+                sessionID:
+                    data.sessionID,
+
+                createdAt:
+                    fullDateTime()
+            });
+
+
+            const saveResult =
+                await saleBatchConsumptionTable.save();
+
+
+            if (
+                saveResult.type !== "success"
+            ) {
+                throw new Error(
+                    `Failed recording batch consumption ` +
+                    `for stock batch ${stockInItemID}`
+                );
+            }
+
+
+            consumptions.push({
+
+                stockInID,
+
+                stockInItemID,
+
+                quantity:
+                    quantityConsumed,
+
+                costPrice,
+
+                totalCost:
+                    batchCost
+            });
+
+
+            totalCost +=
+                batchCost;
+
+            quantityRemaining -=
+                quantityConsumed;
+        }
+
+
+        /* ====================================================
+         * 6. FINAL SAFETY CHECK
+         * ==================================================== */
+
+        if (
+            quantityRemaining > 0
+        ) {
+            throw new Error(
+                `Unable to consume complete quantity. ` +
+                `Remaining: ${quantityRemaining}`
+            );
+        }
+
+
+        /* ====================================================
+         * 7. UPDATE AGGREGATE + LEDGER
+         *
+         * recordInventoryMovement() uses the SAME
+         * transaction because it receives this connection.
+         * ==================================================== */
+
+        const movementResult =
+            await recordInventoryMovement(
+                connection,
+                schema,
+                {
+                    id:
+                        generateID(),
+
+                    businessID:
+                        data.businessID,
+
+                    branchID:
+                        data.branchID,
+
+                    stockID:
+                        data.stockID,
+
+                    productID:
+                        productID,
+
+                    created_by:
+                        data.created_by,
+
+                    referenceType:
+                        "sale",
+
+                    referenceID:
+                        data.saleID,
+
+                    quantityIn:
+                        0,
+
+                    quantityOut:
+                        quantityRequired,
+
+                    /*
+                     * Do not rely on this value inside
+                     * recordInventoryMovement().
+                     *
+                     * It calculates:
+                     * 0 - quantityRequired
+                     */
+                    baseQuantity:
+                        -quantityRequired,
+
+                    currencySnapshotID:
+                        data.currencySnapshotID,
+
+                    sessionID:
+                        data.sessionID,
+
+                    createdAt:
+                        fullDateTime()
+                }
+            );
+
+
+        if (
+            !movementResult.success
+        ) {
+            throw new Error(
+                "Failed recording inventory movement"
+            );
+        }
+
+
+        /* ====================================================
+         * 8. VERIFY FINAL BALANCE
+         *
+         * Recalculate batch balance while transaction is
+         * still open.
+         * ==================================================== */
+
+        const [finalBatchRows]: any =
+            await connection.query(
+                `
+                SELECT
+                    COALESCE(
+                        SUM(sii.remainingQuantity),
+                        0
+                    ) AS totalAvailable
+
+                FROM \`${schema}\`.\`stockInItem\` sii
+
+                INNER JOIN \`${schema}\`.\`stockIn\` si
+                    ON si.id = sii.stockInID
+
+                WHERE sii.businessID = ?
+                  AND si.branchID = ?
+                  AND si.stockID = ?
+                  AND sii.productID = ?
+                  AND sii.status = 'active'
+                `,
+                [
+                    data.businessID,
+                    data.branchID,
+                    data.stockID,
+                    productID
+                ]
+            );
+
+
+        const finalBatchStock =
+            Number(
+                finalBatchRows[0]?.totalAvailable || 0
+            );
+
+
+        const expectedStock =
+            currentStock -
+            quantityRequired;
+
+
+        if (
+            finalBatchStock !==
+            expectedStock
+        ) {
+            throw new Error(
+                `Final inventory mismatch for product ${productID}. ` +
+                `Expected: ${expectedStock}, ` +
+                `batches: ${finalBatchStock}`
+            );
+        }
+
+
+        /* ====================================================
+         * 9. COMMIT
+         * ==================================================== */
+
+        await connection.commit();
+
+
+        return {
+            success: true,
+
+            productID,
+
+            requested:
+                quantityRequired,
+
+            consumed:
+                quantityRequired,
+
+            previousStock:
+                currentStock,
+
+            remainingStock:
+                expectedStock,
+
+            totalCost,
+
+            consumptions
+        };
+
+
+    } catch (error) {
+
+        /*
+         * ANY failure rolls back:
+         *
+         * - batch changes
+         * - saleBatchConsumption
+         * - inventoryMovement
+         * - productInStock
+         */
+        await connection.rollback();
+
+        throw error;
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import { BlurView } from 'expo-blur';
+import { Tabs } from 'expo-router';
+import React from 'react';
+import { Platform, StyleSheet } from 'react-native';
+
+import { HapticTab } from '@/components/HapticTab';
+import ChatTabIcon from '@/components/ui/ChatTabIcon';
+import HomeIcon from '@/components/ui/HomeIcon';
+import MarketIcon from '@/components/ui/MarketIcon';
+import ProfileIcon from '@/components/ui/ProfileIcon';
+import TabBarBackground from '@/components/ui/TabBarBackground';
+import { Colors } from '@/constants/Colors';
+import { Typography } from '@/constants/Design';
+import { useColorScheme } from '@/hooks/useColorScheme';
+
+export default function TabLayout() {
+  const colorScheme = useColorScheme();
+  const themeColors = Colors[colorScheme ?? 'light'];
+  const isDark = colorScheme === 'dark';
+
+  return (
+    <Tabs
+      screenOptions={{
+        tabBarActiveTintColor: themeColors.primary,
+        tabBarInactiveTintColor: themeColors.tabIconDefault,
+        headerShown: false,
+        tabBarButton: HapticTab,
+        tabBarBackground: Platform.OS === 'ios' ? () => (
+          <BlurView 
+            tint={isDark ? 'dark' : 'light'} 
+            intensity={isDark ? 70 : 90} 
+            style={StyleSheet.absoluteFill}
+          />
+        ) : TabBarBackground,
+        tabBarStyle: Platform.select({
+          ios: {
+            backgroundColor: 'rgba(255, 255, 255, 0.1)',
+            borderTopWidth: 0.5,
+            borderTopColor: isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)',
+            elevation: 0,
+            height: 85,
+            paddingBottom: 20,
+            position: 'absolute',
+          },
+          default: {
+            backgroundColor: themeColors.card,
+            borderTopColor: themeColors.border,
+            borderTopWidth: 1,
+            height: 60,
+            paddingBottom: 8,
+            paddingTop: 8,
+          },
+        }),
+        tabBarLabelStyle: {
+          fontSize: Typography.caption,
+          fontWeight: Typography.medium,
+          marginTop: 2,
+        },
+        tabBarIconStyle: {
+          marginBottom: 0,
+        },
+      }}
+    >
+      <Tabs.Screen
+        name="index"
+        options={{
+          title: 'Home',
+          tabBarIcon: ({ color, focused }) => <HomeIcon color={color} size={28} active={focused} />,
+        }}
+      />
+      <Tabs.Screen
+        name="shop"
+        options={{
+          title: 'Shop',
+          tabBarIcon: ({ color, focused }) => <MarketIcon color={color} size={28} focused={focused} />,
+        }}
+      />
+      <Tabs.Screen
+        name="chat"
+        options={{
+          title: 'Chat',
+          tabBarIcon: ({ color, focused }) => <ChatTabIcon color={color} focused={focused} />,
+        }}
+      />
+      <Tabs.Screen
+        name="profile"
+        options={{
+          title: 'Profile',
+          tabBarIcon: ({ color, focused }) => <ProfileIcon color={color} size={28} active={focused} />,
+        }}
+      />
+    </Tabs>
+  );
+}
+
+
+<ThemedView style={styles.servicesContainer}>
+                            <ThemedText style={styles.sectionTitle}>Top 10 Products</ThemedText>
+                            <ScrollView showsVerticalScrollIndicator={true}>
+                                {topProductList.length > 0 ? topProductList.map((item, index) => (
+                                    <TouchableOpacity key={index} activeOpacity={0.7}>
+                                        <ThemedView style={[styles.businessItem, index < 3 && {
+                                            borderBottomColor: themeColors.border, borderBottomWidth: 0.5,
+                                            backgroundColor: `${themeColors.primary}30`, marginBottom: 2, flexDirection: 'row'
+                                        }]}>
+                                            <Ionicons name='cube-outline' size={15} color={themeColors.text} style={{marginRight: 5}} />
+                                            <ThemedText style={{fontSize: 10.5, fontFamily: 'Medium'}}>{item?.name}</ThemedText>
+                                        </ThemedView>
+                                    </TouchableOpacity>
+                                )) : (
+                                    <View style={{justifyContent: 'center', alignItems: 'center', paddingVertical: 50}}>
+                                        <ThemedText style={{ fontSize: 12, color: themeColors.subtleText }}>
+                                            0 product found
+                                        </ThemedText>
+                                    </View>
+                                )}
+                            </ScrollView>
+                        </ThemedView>
+
+
+
+
+
+
+
+
+
+    // const totalPaid = payments.reduce((sum, p) => Number(sum) + (Number(p.amount) || 0), 0);
+    // const remaining = Math.max(grandTotal - totalPaid, 0);
+    // const change = Math.max(totalPaid - grandTotal, 0);
+
+    // const addPayment = (method: TPaymentMethod) => {
+    //     setPayments(prev => [
+    //         ...prev, {
+    //             id: generateId(),
+    //             method,
+    //             amount: 0,
+    //             status: 'idle',
+    //         }
+    //     ])
+    // }
+
+    // const updatePayment = (id: string, field: keyof PaymentEntry, value: any) => {
+    //     setPayments(prev => prev.map(p => p.id === id ? { ...p, [field]: field === 'amount' ? value : value } : p)
+    // )}
+
+    // const removePayment = (id: string) => {
+    //     setPayments(prev => prev.filter(p => p.id !== id));
+    // }
+
+    // const processPayments = async () => {
+    //     if (totalPaid < grandTotal) {
+    //         Alert.alert('Payment incomplete', 'Amount is not enough');
+    //         return;
+    //     }
+    //     setProcessing(true);
+    //     setPayments(prev =>
+    //         prev.map(p => ({ ...p, status: 'processing' }))
+    //     );
+    //     await Promise.all( payments.map(p => new Promise<void>(resolve => {
+    //         setTimeout(() => {
+    //             setPayments(prev =>
+    //                 prev.map(x => x.id === p.id ? { ...x, status: 'success' } : x
+    //             )
+    //         )
+    //         resolve()}, 2000);
+    //     })))
+    //     setProcessing(false);
+    //     // Alert.alert('Success', 'Payment received');
+    // }
+
+    // const handlePayment = () => {
+        
+    // }
+
+
+import { useEffect, useMemo, useState } from "react"
+import { Alert } from "react-native"
+import SocketIO from "../utils/Socket"
+
+// ---------------- TYPES ----------------
+
+type Tax = {
+    id: number
+    taxName: string
+    percentage: number
+    calculationType: 'simple' | 'compound'
+    order: number
+}
+
+type CartItem = {
+    productID: number
+    name: string
+    price: number
+    qty: number
+    total: number
+    taxGroupID: number | null
+}
+
+// ---------------- STATE ----------------
+
+const [cart, setCart] = useState<CartItem[]>([])
+const [taxMap, setTaxMap] = useState<Record<number, Tax[]>>({})
+
+// ---------------- LOAD TAX CONFIG ----------------
+
+const loadTaxes = async () => {
+    SocketIO.emit('fetch-full-tax-config', {
+        sessionID: session,
+        businessID: selectedBusiness.id
+    }, (response: any) => {
+        if (response.status === "success") {
+            const { taxes, groups, groupItems } = response.data
+
+            const map: Record<number, Tax[]> = {}
+
+            groups.forEach((group: any) => {
+                const items = groupItems
+                    .filter((i: any) => i.taxGroupID === group.id)
+                    .sort((a: any, b: any) => a.order - b.order)
+
+                map[group.id] = items.map((item: any) => {
+                    const tax = taxes.find((t: any) => t.id === item.taxID)
+
+                    return {
+                        id: tax.id,
+                        taxName: tax.taxName,
+                        percentage: tax.percentage,
+                        calculationType: tax.calculationType,
+                        order: item.order
+                    }
+                })
+            })
+
+            setTaxMap(map)
+        }
+    })
+}
+
+useEffect(() => {
+    if (selectedBusiness?.id) {
+        loadTaxes()
+    }
+}, [selectedBusiness?.id])
+
+// ---------------- ADD ITEM ----------------
+
+const handleAddItem = (product: any) => {
+    if (!product) return
+
+    const newItem: CartItem = {
+        productID: product.id,
+        name: product.productName,
+        price: product.price,
+        qty: 1,
+        total: product.price,
+        taxGroupID: Number(product.taxGroupID) || null
+    }
+
+    setCart(prev => [...prev, newItem])
+}
+
+// ---------------- UPDATE QTY ----------------
+
+const updateQty = (index: number, qty: number) => {
+    const updated = [...cart]
+
+    updated[index].qty = qty
+    updated[index].total = qty * updated[index].price
+
+    setCart(updated)
+}
+
+// ---------------- TAX CALCULATION ----------------
+
+const taxSummary = useMemo(() => {
+    let totalTax = 0
+    let breakdown: any[] = []
+
+    cart.forEach(item => {
+        if (!item.taxGroupID) return
+
+        const taxes = taxMap[item.taxGroupID] || []
+        let baseAmount = item.total
+
+        taxes.forEach((tax) => {
+            let taxAmount = 0
+
+            if (tax.calculationType === 'compound') {
+                taxAmount = (baseAmount * tax.percentage) / 100
+                baseAmount += taxAmount
+            } else {
+                taxAmount = (item.total * tax.percentage) / 100
+            }
+
+            totalTax += taxAmount
+
+            const existing = breakdown.find(t => t.id === tax.id)
+
+            if (existing) {
+                existing.amount += taxAmount
+            } else {
+                breakdown.push({
+                    id: tax.id,
+                    name: tax.taxName,
+                    percentage: tax.percentage,
+                    amount: taxAmount
+                })
+            }
+        })
+    })
+
+    return { breakdown, totalTax }
+}, [cart, taxMap])
+
+// ---------------- TOTAL ----------------
+
+const subtotal = useMemo(() => {
+    return cart.reduce((sum, item) => sum + item.total, 0)
+}, [cart])
+
+const grandTotal = useMemo(() => {
+    return subtotal + taxSummary.totalTax
+}, [subtotal, taxSummary])
+
+// ---------------- SAVE SALE ----------------
+
+const saveSale = async () => {
+    if (!session || !selectedBusiness.id || !userData?.id) {
+        Alert.alert("Error", "Missing required fields")
+        return
+    }
+
+    if (!cart.length) {
+        Alert.alert("Error", "No items in cart")
+        return
+    }
+
+    const payload = {
+        items: cart,
+        sessionID: session,
+        businessID: selectedBusiness.id
+    }
+
+    SocketIO.emit('save-sale', payload, (response: any) => {
+        if (response.status === "success") {
+            Alert.alert("Success", response.message)
+            setCart([])
+        } else {
+            Alert.alert("Error", response.message || "Failed")
+        }
+    })
+}
+
+// ---------------- REMOVE ITEM ----------------
+
+const removeItem = (index: number) => {
+    const updated = [...cart]
+    updated.splice(index, 1)
+    setCart(updated)
+}
+
+
+
+
+import { NativeStackScreenProps } from '@react-navigation/native-stack';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, useColorScheme, View, Switch } from 'react-native';
+import { BottomSheetSelectOption, BusinessNavigationList, UserNavigationList } from '../../../utils/types/index.type';
+import { Colors } from '../../../utils/constants/Colors';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useAppContainer } from '../../../configuration/navigation/AppContainer';
+import { Borders, Spacing, Typography } from '../../../utils/constants/Design';
+import { ThemedView } from '../../../components/ui/ThemedView';
+import { ThemedText } from '../../../components/ui/ThemedText';
+import { IconSymbol } from '../../../components/ui/icon-symbol';
+import BottomSheet, { BottomSheetScrollView, BottomSheetView } from '@gorhom/bottom-sheet';
+import { SocketIO } from '../../../configuration/helpers/main.helpers';
+import { getData } from '../../../configuration/helpers/auth.helpers';
+
+type FormState = {
+    user: BottomSheetSelectOption | null
+    feature: BottomSheetSelectOption | null
+}
+
+type PermissionValue = 'yes' | 'no';
+
+type PermissionMap = {
+    [group: string]: {
+        [permission: string]: PermissionValue;
+    };
+};
+
+type TPermissionScreen = NativeStackScreenProps<UserNavigationList, "PermissionScreen">
+const PermissionScreen = ({navigation}: TPermissionScreen) => {
+    const colorScheme = useColorScheme()
+    const themeColors = Colors[colorScheme ?? 'light']
+    const isDark = colorScheme === 'dark'
+    const insets = useSafeAreaInsets()
+    const { session, selectedBusiness, packageName } = useAppContainer()
+    const [userList, setUserList] = useState<any[]>([])
+    const [roleList, setRoleList] = useState<any[]>([])
+    const [featureList, setFeatureList] = useState<any[]>([])
+    const [showUser, setShowUser] = useState<boolean>(false)
+    const [showRole, setShowRole] = useState<boolean>(false)
+    const [permissionList, setPermissionList] = useState<any[]>([])
+    const [userPermissionList, setUserPermissionList] = useState<PermissionMap>({})
+
+    const [form, setForm] = useState<FormState>({
+        // type: packageName === "Micro" ? {key: 'user', value: "User Based Permission"} : null,
+        user: null,
+        feature: null
+    })
+
+    const fetchRoles = async () => {
+        SocketIO.emit('fetch-roles' , {sessionID: session, businessID: selectedBusiness.id}, (response: any) => {
+            if (response.status === "success") {
+                const simplified = (response.data || []).map((item: any) => ({
+                    key: item.id,
+                    value: `${item.name}`
+                }))
+                setRoleList(simplified)
+            } else {
+                Alert.alert("Error", "Error fetching roles", response.message)
+            }
+        })
+    }
+
+    const fetchUsers = async () => {
+        SocketIO.emit('fetch-users' , {sessionID: session, businessID: selectedBusiness.id}, (response: any) => {
+            if (response.status === "success") {
+                const simplified = (response.data || []).map((item: any) => ({
+                    key: item.user_id,
+                    value: `${item.full_name}  ( ${item?.role?.replace(/\b\w/g, (c:any) => c.toUpperCase()) || ''}, ${item?.phone || ''} )`
+                }))
+                setUserList(simplified)
+            } else {
+                Alert.alert("Error", "Error fetching users", response.message)
+            }
+        })
+    }
+
+    const fetchPermissions = async () => {
+        const packageName = await getData('packageName')
+        if (!packageName) return
+        SocketIO.emit('fetch-privileges' , {sessionID: session, businessID: selectedBusiness.id, plan: packageName}, (response: any) => {
+            if (response.status === "success") {
+                const simplified = (response.data || []).map((item: any) => ({
+                    key: item.name.toLowerCase(),
+                    value: `${item.name || 'Name'}`
+                }))
+                setPermissionList(response.data || [])
+                setFeatureList(simplified)
+            } else {
+                setPermissionList([])
+            }
+        })
+    }
+
+    const fetchUserPermissions = async () => {
+        SocketIO.emit('user-privileges' , {sessionID: session, businessID: selectedBusiness.id, type: form.type?.key,
+            userID: form.user?.key, groupID: form.role?.key
+        }, (response: any) => {
+            if (response.status === "success") {
+                console.log(response.data || [])
+                setUserPermissionList(response.data || [])
+            } else {
+                setUserPermissionList({})
+            }
+        })
+    }
+
+    useEffect(()=> {
+        if (!form.user && !form.role) return
+        fetchPermissions()
+        fetchUserPermissions()
+    }, [form.user, form.role])
+
+    // useEffect(() => {
+    //     if ( (form.type.key === "role" && form.user !== null) || (form.type.key === "user" && form.role !== null) ) {
+    //         setForm(prev => ({
+    //             ...prev,
+    //             role: null,
+    //             user: null,
+    //             feature: null
+    //         }))
+    //     }
+    
+    //     if (form.type.key === "role") {
+    //         fetchRoles();
+    //         setShowRole(true);
+    //         setShowUser(false);
+    //     } else if (form.type.key === "user") {
+    //         fetchUsers();
+    //         setShowUser(true);
+    //         setShowRole(false);
+    //     }
+    // }, [form.type])
+
+    const hasPermission = (group: string, perm: string) => userPermissionList?.[group]?.[perm] === 'yes'
+
+    const togglePermission = async (group: string, perm: string, enabled: boolean) => {
+        if (!selectedBusiness.id || !perm) {
+            console.log('required')
+            return
+        }
+        if (perm === 'assignAllPrivileges' && enabled) {
+            const groupData = permissionList.find((p: any) => p.name === group)
+            if (!groupData) return
+            groupData.columns.forEach((col: any) => {
+                SocketIO.emit('insert-update-Privilege' , {sessionID: session, businessID: selectedBusiness.id, type: form.type?.key,
+                    userID: form.user?.key, groupID: form.role?.key, privilegeName: col.name, value: enabled, category: form.feature?.value
+                }, () => {})
+            })
+            const all: any = {}
+            groupData?.columns.forEach((c: any) => (all[c.name] = 'yes'))
+            setUserPermissionList((prev: any) => ({ ...prev, [group]: all }))
+            return
+        }
+
+        SocketIO.emit('insert-update-Privilege' , {sessionID: session, businessID: selectedBusiness.id, type: form.type?.key,
+            userID: form.type?.key === "user" ? form.user?.key : null, groupID: form.type?.key === "role" ? form.role?.key : null, 
+            privilegeName: perm, value: enabled, category: form.feature?.value
+        }, (response: any) => {
+            if (response.status === "success") {
+                setUserPermissionList((prev: any) => ({
+                    ...prev, [group]: {
+                        ...prev[group],
+                        [perm]: enabled ? 'yes' : 'no'
+                    }
+                }))
+            }
+        })
+    }
+
+    const [sheetOptions, setSheetOptions] = useState<BottomSheetSelectOption[]>([])
+    const [sheetTitle, setSheetTitle] = useState<string>('')
+    const [activeField, setActiveField] = useState<string | null>(null)
+
+    const bottomSheetRef = useRef<BottomSheet>(null)
+    const snapPoints = useMemo(() => ["40%", "50%", "75%"], [])
+
+    const openBottomSheet = (field: keyof typeof form, options: BottomSheetSelectOption[], title: string) => {
+        setActiveField(field)
+        setSheetOptions(options)
+        setSheetTitle(title)
+        bottomSheetRef.current?.snapToIndex(0)
+    }
+
+    const selectOption = (option: BottomSheetSelectOption) => {
+        if (activeField) {
+            setForm(prev => ({ ...prev, [activeField]: option }))
+        }
+        bottomSheetRef.current?.close()
+    }
+
+    const selectedPermissionGroup = useMemo(() => {
+        if (!form.feature) return null
+        return permissionList.find((group: any) => group.name.toLowerCase() === form.feature?.key)
+    }, [form.feature, permissionList])
+
+    return (
+        <View style={[styles.container, { backgroundColor: themeColors.background }]}>
+            {Platform.OS === 'android' && ( <View style={[ styles.statusBarSpacer, { height: 10 || 0, backgroundColor: themeColors.background} ]} /> )}
+            <View style={[ styles.safeArea, { backgroundColor: themeColors.background, paddingTop: Platform.OS === 'ios' ? insets.top : 0, paddingBottom: Platform.OS === "ios" ? 85 : 0 } ]}>
+                <ThemedView style={[styles.header, { backgroundColor: themeColors.background, borderBottomColor: themeColors.border }]}>
+                    <TouchableOpacity onPress={()=> navigation.goBack()} style={[styles.backButtonMain, { backgroundColor: themeColors.subtleBackground }]}>
+                        <IconSymbol name="arrow.left" size={20} color={themeColors.icon} />
+                    </TouchableOpacity>
+                    <ThemedText style={styles.headerTitle}>Permissions</ThemedText>
+                    <View style={{ width: 36 }} />
+                </ThemedView>
+                <KeyboardAvoidingView style={{flex: 1}} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+                    <ScrollView style={styles.scrollContainer} contentContainerStyle={[ styles.contentContainer,{ paddingBottom: insets.bottom + 100, paddingTop: 10 }]} showsVerticalScrollIndicator={false} bounces={false}>
+                        <View style={styles.section}>
+                            <ThemedText style={{...styles.sectionTitle, color: themeColors.subtleText}}>Permission Type ( <Text style={{fontFamily: 'Italic', fontSize: 12, color: themeColors.error}}>Required</Text> )</ThemedText>
+                            <TouchableOpacity disabled={packageName === "Micro" ? true : false} style={[styles.input, { justifyContent: 'center', backgroundColor: packageName === "Micro" ? themeColors.border : themeColors.inputBackground, borderColor: themeColors.border }]} onPress={() => openBottomSheet('type', permissionTypes, 'Select Permission Type')}>
+                                <Text style={{ color: form.type ? themeColors.text : themeColors.subtleText, fontSize: Typography.small }}>
+                                    {form.type?.value || 'Select type'}
+                                </Text>
+                            </TouchableOpacity>
+                        </View>
+                        {showUser && (
+                            <View style={styles.section}>
+                                <ThemedText style={{...styles.sectionTitle, color: themeColors.subtleText}}>User ( <Text style={{fontFamily: 'Italic', fontSize: 12, color: themeColors.error}}>Required</Text> )</ThemedText>
+                                <TouchableOpacity style={[styles.input, { justifyContent: 'center', backgroundColor: themeColors.inputBackground, borderColor: themeColors.border }]} onPress={() => openBottomSheet('user', userList, 'Select user')}>
+                                    <Text style={{ color: form.user ? themeColors.text : themeColors.subtleText, fontSize: Typography.small }}>
+                                        {form.user?.value || 'Select user'}
+                                    </Text>
+                                </TouchableOpacity>
+                            </View>
+                        )}
+                        {showRole && (
+                            <View style={styles.section}>
+                                <ThemedText style={{...styles.sectionTitle, color: themeColors.subtleText}}>Role ( <Text style={{fontFamily: 'Italic', fontSize: 12, color: themeColors.error}}>Required</Text> )</ThemedText>
+                                <TouchableOpacity style={[styles.input, { justifyContent: 'center', backgroundColor: themeColors.inputBackground, borderColor: themeColors.border }]} onPress={() => openBottomSheet('role', roleList, 'Select Role')}>
+                                    <Text style={{ color: form.role ? themeColors.text : themeColors.subtleText, fontSize: Typography.small }}>
+                                        {form.role?.value || 'Select role'}
+                                    </Text>
+                                </TouchableOpacity>
+                            </View>
+                        )}
+                        {permissionList.length > 0 && (
+                            <View style={styles.section}>
+                                <ThemedText style={{...styles.sectionTitle, color: themeColors.subtleText}}>Feature ( <Text style={{fontFamily: 'Italic', fontSize: 12, color: themeColors.error}}>Required</Text> )</ThemedText>
+                                <TouchableOpacity style={[styles.input, { justifyContent: 'center', backgroundColor: themeColors.inputBackground, borderColor: themeColors.border }]} onPress={() => openBottomSheet('feature', featureList, 'Select Feature')}>
+                                    <Text style={{ color: form.feature ? themeColors.text : themeColors.subtleText, fontSize: Typography.small }}>
+                                        {form.feature?.value || 'Select permission'}
+                                    </Text>
+                                </TouchableOpacity>
+                            </View>
+                        )}
+                        <View style={{ marginTop: 24 }}>
+                            <ThemedText style={styles.groupTitle}>{selectedPermissionGroup?.title || ''}</ThemedText>
+                            {selectedPermissionGroup && selectedPermissionGroup.columns.map((perm: any) => (
+                                <View key={perm.name} style={{...styles.permissionRow, borderBottomColor: themeColors.border}}>
+                                    <View style={{ flex: 1 }}>
+                                        <ThemedText style={{fontSize: 12, fontFamily: 'SemiBold'}}>{perm.title}</ThemedText>
+                                        <ThemedText style={styles.desc}>{perm.description}</ThemedText>
+                                    </View>
+                                    <Switch value={hasPermission(selectedPermissionGroup.name, perm.name)} onValueChange={v => togglePermission(selectedPermissionGroup.name, perm.name, v) } />
+                                </View>
+                            ))}
+                        </View>
+                    </ScrollView>
+                </KeyboardAvoidingView>
+                <BottomSheet ref={bottomSheetRef} index={-1} snapPoints={snapPoints} enablePanDownToClose enableContentPanningGesture enableHandlePanningGesture enableDynamicSizing={false} handleIndicatorStyle={{ backgroundColor: themeColors.icon, marginTop: 10 }} backgroundStyle={{backgroundColor: themeColors.background, borderTopWidth: 1, borderTopColor: themeColors.info}}>
+                    <ThemedText style={{fontFamily: 'SemiBold', fontSize: 20, marginBottom: 20, textAlign: 'center', marginTop: 10}}>{sheetTitle || 'Select Option'}</ThemedText>
+                    <BottomSheetScrollView contentContainerStyle={{ paddingHorizontal: 16 }}>
+                        {sheetOptions.map(option => (
+                            <TouchableOpacity key={option.key} style={{ padding: 20, backgroundColor: themeColors.card, borderRadius: 5, marginBottom: 5 }} onPress={() => selectOption({key: option.key, value: option.value})}>
+                                <Text style={{ fontSize: Typography.body, color: themeColors.text, fontFamily: "Medium" }}>{option.value}</Text>
+                            </TouchableOpacity>
+                        ))}
+                    </BottomSheetScrollView>
+                </BottomSheet>
+            </View>
+        </View>
+    )
+}
+
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+    },
+    statusBarSpacer: {
+        width: '100%',
+    },
+    safeArea: {
+        flex: 1,
+    },
+    scrollContainer: {
+        flex: 1,
+    },
+    contentContainer: {
+        padding: Spacing.screenPadding,
+        paddingTop: 0
+    },
+    header: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        paddingHorizontal: Spacing.screenPadding,
+        paddingVertical: Spacing.medium,
+        borderBottomWidth: 1,
+    },
+    backButton: {
+        width: 36,
+        height: 36,
+        borderRadius: 18,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    headerTitle: {
+        fontSize: Typography.heading2,
+        fontFamily: 'SemiBold'
+    },
+    backButtonMain: {
+        width: 36,
+        height: 36,
+        borderRadius: 18,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    section: {
+        marginBottom: 0
+    },
+    sectionTitle: {
+        fontSize: Typography.body,
+        fontFamily: 'Medium',
+        marginBottom: 3,
+    },
+    input: {
+        borderWidth: 1,
+        borderRadius: Borders.radiusSmall,
+        paddingHorizontal: Spacing.medium,
+        paddingVertical: Spacing.large,
+        fontSize: Typography.small,
+        marginBottom: Spacing.medium,
+        fontFamily: 'Regular'
+    },
+    footer: {
+        padding: Spacing.screenPadding,
+        borderTopWidth: 1,
+    },
+    button: {
+        paddingVertical: Spacing.large,
+        borderRadius: Borders.radiusSmall,
+        alignItems: 'center',
+    },
+    buttonText: {
+        color: '#FFFFFF',
+        fontSize: Typography.body,
+        fontFamily: 'SemiBold'
+    },
+    groupTitle: { fontSize: 15, fontFamily: 'SemiBold' },
+    permissionRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 12,
+        borderBottomWidth: 1,
+    },
+    desc: { fontSize: 11, opacity: 0.6, fontFamily: 'Regular' },
+})
+
+export default PermissionScreen
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React from 'react';
+import { View, Text } from 'react-native';
+import Svg, { Circle } from 'react-native-svg';
+
+type ChartItem = {
+    label: string;
+    value: number;
+    color: string;
+};
+
+type DonutChartProps = {
+    data: ChartItem[];
+    total?: number;
+    size?: number;
+    strokeWidth?: number;
+};
+
+const DonutChart = ({
+    data,
+    total,
+    size = 220,
+    strokeWidth = 32,
+}: DonutChartProps) => {
+    const center = size / 2;
+    const radius = (size - strokeWidth) / 2;
+    const circumference = 2 * Math.PI * radius;
+
+    const chartTotal = total ?? data.reduce((sum, item) => sum + item.value, 0);
+
+    // Space between segments
+    const gap = 8;
+
+    let currentOffset = 0;
+
+    return (
+        <View
+            style={{
+                width: size,
+                height: size,
+                alignItems: 'center',
+                justifyContent: 'center',
+            }}
+        >
+            <Svg width={size} height={size}>
+                {data.map((item, index) => {
+                    const percentage = item.value / chartTotal;
+
+                    const segmentLength =
+                        circumference * percentage - gap;
+
+                    const dashArray = `${segmentLength} ${
+                        circumference - segmentLength
+                    }`;
+
+                    const rotation =
+                        (currentOffset / circumference) * 360 - 90;
+
+                    currentOffset += circumference * percentage;
+
+                    return (
+                        <Circle
+                            key={index}
+                            cx={center}
+                            cy={center}
+                            r={radius}
+                            stroke={item.color}
+                            strokeWidth={strokeWidth}
+                            fill="none"
+                            strokeDasharray={dashArray}
+                            strokeDashoffset={0}
+                            strokeLinecap="round"
+                            rotation={rotation}
+                            origin={`${center}, ${center}`}
+                        />
+                    );
+                })}
+            </Svg>
+
+            {/* Center content */}
+            <View
+                style={{
+                    position: 'absolute',
+                    alignItems: 'center',
+                }}
+            >
+                <Text
+                    style={{
+                        color: '#777',
+                        fontSize: 14,
+                    }}
+                >
+                    Take home
+                </Text>
+
+                <Text
+                    style={{
+                        color: '#111',
+                        fontSize: 20,
+                        fontWeight: '600',
+                        marginTop: 4,
+                    }}
+                >
+                    $1,232.03
+                </Text>
+            </View>
+        </View>
+    );
+};
+
+export default DonutChart;
+
+
+
+const payrollData = [
+    {
+        label: 'Net pay',
+        value: 1232,
+        color: '#51B6A5',
+    },
+    {
+        label: 'Overtime',
+        value: 500,
+        color: '#3975E8',
+    },
+    {
+        label: 'Pension',
+        value: 300,
+        color: '#8354DF',
+    },
+    {
+        label: 'Benefits',
+        value: 200,
+        color: '#F1C344',
+    },
+    {
+        label: 'Deductions',
+        value: 150,
+        color: '#D96C4B',
+    },
+];
+
+
+<DonutChart
+    data={payrollData}
+    size={220}
+    strokeWidth={32}
+/>
+
+
+<View
+    style={{
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#fff',
+        borderRadius: 25,
+        padding: 20,
+    }}
+>
+    <DonutChart
+        data={payrollData}
+        size={220}
+        strokeWidth={32}
+    />
+
+    <View style={{ marginLeft: 20 }}>
+        {payrollData.map((item) => (
+            <View
+                key={item.label}
+                style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    marginBottom: 18,
+                }}
+            >
+                <View
+                    style={{
+                        width: 12,
+                        height: 12,
+                        borderRadius: 4,
+                        backgroundColor: item.color,
+                        marginRight: 10,
+                    }}
+                />
+
+                <Text
+                    style={{
+                        fontSize: 15,
+                        color: '#222',
+                    }}
+                >
+                    {item.label}
+                </Text>
+            </View>
+        ))}
+    </View>
+</View>
+
+
+<DonutChart
+    data={payrollData}
+    size={220}
+    strokeWidth={32}
+    gap={10}
+/>

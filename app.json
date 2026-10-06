@@ -1,0 +1,71 @@
+{
+  "expo": {
+    "name": " ",
+    "slug": "enca-suito",
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/logo_icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.hackmanling-dev.encasuito"
+    },
+    "android": {
+      "softwareKeyboardLayoutMode": "resize",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/logo_icon2.png",
+        "backgroundColor": "#ffffff"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.hackmanling_dev.encasuito"
+    },
+    "web": {
+      "favicon": "./assets/logo_icon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to access your camera",
+          "microphonePermission": "Allow $(PRODUCT_NAME) to access your microphone",
+          "recordAudioAndroid": true
+        }
+      ],
+      "expo-font",
+      "expo-web-browser",
+      "@react-native-community/datetimepicker",
+      "expo-image",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/logo_icon2.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#FFFFFF"
+        }
+      ],
+      "expo-status-bar",
+      "expo-sqlite"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "122fa9c4-7225-4e91-8afd-0e81cca3769a"
+      }
+    },
+    "owner": "hackmanling_dev",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/122fa9c4-7225-4e91-8afd-0e81cca3769a"
+    }
+  }
+}
